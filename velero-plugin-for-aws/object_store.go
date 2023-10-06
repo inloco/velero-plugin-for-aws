@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"io"
 	"net/http"
@@ -32,6 +33,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
+	"github.com/aws/aws-sdk-go/service/kms"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/pkg/errors"
@@ -67,6 +69,7 @@ type s3Interface interface {
 type ObjectStore struct {
 	log                  logrus.FieldLogger
 	s3                   s3Interface
+	kms                  *kms.KMS
 	preSignS3            s3Interface
 	s3Uploader           *s3manager.Uploader
 	kmsKeyID             string
@@ -188,6 +191,7 @@ func (o *ObjectStore) Init(config map[string]string) error {
 	}
 
 	o.s3 = s3.New(serverSession)
+	o.kms = kms.New(serverSession)
 	o.s3Uploader = s3manager.NewUploader(serverSession)
 	o.kmsKeyID = kmsKeyID
 	o.serverSideEncryption = serverSideEncryption
@@ -316,10 +320,21 @@ func newAWSConfig(url, region string, forcePathStyle bool) (*aws.Config, error) 
 }
 
 func (o *ObjectStore) PutObject(bucket, key string, body io.Reader) error {
+	bodyContent, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+
+	encryptedContent, err := EncryptKMS(o.kms, bodyContent)
+	if err != nil {
+		return err
+	}
+	encryptedBody := bytes.NewReader(encryptedContent)
+
 	req := &s3manager.UploadInput{
 		Bucket: &bucket,
 		Key:    &key,
-		Body:   body,
+		Body:   encryptedBody,
 	}
 
 	switch {
@@ -337,7 +352,7 @@ func (o *ObjectStore) PutObject(bucket, key string, body io.Reader) error {
 		req.ServerSideEncryption = aws.String(o.serverSideEncryption)
 	}
 
-	_, err := o.s3Uploader.Upload(req)
+	_, err = o.s3Uploader.Upload(req)
 
 	return errors.Wrapf(err, "error putting object %s", key)
 }
@@ -405,7 +420,23 @@ func (o *ObjectStore) GetObject(bucket, key string) (io.ReadCloser, error) {
 		return nil, errors.Wrapf(err, "error getting object %s", key)
 	}
 
-	return res.Body, nil
+	bodyContent, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	err = res.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	decryptedContent, err := DecryptKMS(o.kms, bodyContent)
+	if err != nil {
+		return nil, err
+	}
+	decryptedBody := io.NopCloser(bytes.NewReader(decryptedContent))
+
+	return decryptedBody, nil
 }
 
 func (o *ObjectStore) ListCommonPrefixes(bucket, prefix, delimiter string) ([]string, error) {
@@ -471,6 +502,19 @@ func (o *ObjectStore) CreateSignedURL(bucket, key string, ttl time.Duration) (st
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
+
+	bodyContent, err := io.ReadAll(req.Body)
+	if err != nil {
+		return "", err
+	}
+
+	decryptedContent, err := DecryptKMS(o.kms, bodyContent)
+	if err != nil {
+		return "", err
+	}
+
+	decryptedBody := bytes.NewReader(decryptedContent)
+	req.Body = decryptedBody
 
 	if o.signatureVersion == "1" {
 		req.Handlers.Sign.Remove(v4.SignRequestHandler)
