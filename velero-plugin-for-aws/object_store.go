@@ -19,21 +19,26 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"io"
 	"os"
 	"sort"
 	"strconv"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
 	veleroplugin "github.com/vmware-tanzu/velero/pkg/plugin/framework"
+
+	"bytes"
+
+	"github.com/aws/aws-sdk-go-v2/service/kms"
 )
 
 const (
@@ -70,6 +75,7 @@ type ObjectStore struct {
 	s3                   s3Interface
 	preSignS3            s3PresignInterface
 	s3Uploader           *manager.Uploader
+	kms                  *kms.Client
 	kmsKeyID             string
 	sseCustomerKey       string
 	signatureVersion     string
@@ -172,6 +178,7 @@ func (o *ObjectStore) Init(config map[string]string) error {
 	}
 	o.s3 = client
 	o.s3Uploader = manager.NewUploader(client)
+	o.kms = kms.NewFromConfig(cfg)
 	o.kmsKeyID = kmsKeyID
 	o.serverSideEncryption = serverSideEncryption
 	o.tagging = tagging
@@ -249,10 +256,21 @@ func readCustomerKey(customerKeyEncryptionFile string) (string, error) {
 }
 
 func (o *ObjectStore) PutObject(bucket, key string, body io.Reader) error {
+	bodyContent, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+
+	encryptedContent, err := EncryptKMS(o.kms, bodyContent)
+	if err != nil {
+		return err
+	}
+	encryptedBody := bytes.NewReader(encryptedContent)
+
 	input := &s3.PutObjectInput{
 		Bucket:  aws.String(bucket),
 		Key:     aws.String(key),
-		Body:    body,
+		Body:    encryptedBody,
 		Tagging: aws.String(o.tagging),
 	}
 
@@ -275,7 +293,7 @@ func (o *ObjectStore) PutObject(bucket, key string, body io.Reader) error {
 		input.ChecksumAlgorithm = types.ChecksumAlgorithm(o.checksumAlg)
 	}
 
-	_, err := o.s3Uploader.Upload(context.Background(), input)
+	_, err = o.s3Uploader.Upload(context.Background(), input)
 
 	return errors.Wrapf(err, "error putting object %s", key)
 }
@@ -335,7 +353,23 @@ func (o *ObjectStore) GetObject(bucket, key string) (io.ReadCloser, error) {
 		return nil, errors.Wrapf(err, "error getting object %s", key)
 	}
 
-	return output.Body, nil
+	bodyContent, err := io.ReadAll(output.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	err = output.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	decryptedContent, err := DecryptKMS(o.kms, bodyContent)
+	if err != nil {
+		return nil, err
+	}
+	decryptedBody := io.NopCloser(bytes.NewReader(decryptedContent))
+
+	return decryptedBody, nil
 }
 
 func (o *ObjectStore) ListCommonPrefixes(bucket, prefix, delimiter string) ([]string, error) {
